@@ -29,37 +29,46 @@ class Config:
     # [1] 檔案路徑設定
     # -----------------------------------------------------------
     VIDEO_PATH: any = 1  
-    MODEL_TRAFFIC: str = "Model/traffic_1280.pt" 
-    MODEL_ROAD: str = "best.pt"            
-    MODEL_COMMON: str = "yolov8n.pt"       
-    MODEL_CNN: str = "cnn_digit_model_new.h5" 
+    MODEL_TRAFFIC: str = "Model/traffic&count.pt" 
+    
+    # ★ 恢復斑馬線模型 (原本叫 MODEL_ROAD，現在正名為 MODEL_ZEBRA)
+    MODEL_ZEBRA: str = "Model/zebra.pt"            
+    
+    MODEL_COMMON: str = "Model/yolov8n.pt"       
+    MODEL_CNN: str = "Model/cnn_digit_model_new.h5" 
     
     # -----------------------------------------------------------
-    # [2] 解析度設定
+    # [2] 解析度設定 (維持高效能設定)
     # -----------------------------------------------------------
-    IMGSZ_TRAFFIC: int = 1280    
-    IMGSZ_ROAD: int = 640        
-    IMGSZ_COMMON: int = 320      
+    IMGSZ_TRAFFIC: int = 640    # 紅綠燈 (降解析度求順暢)
+    IMGSZ_ZEBRA: int = 640      # 斑馬線
+    IMGSZ_COMMON: int = 320     # 障礙物
     
     # -----------------------------------------------------------
     # [3] 信心門檻
     # -----------------------------------------------------------
     CONF_TRAFFIC: float = 0.5    
-    CONF_ROAD: float = 0.25      
+    CONF_ZEBRA: float = 0.25     
     CONF_COMMON: float = 0.5     
     CONF_CNN: float = 0.7        
     
     # -----------------------------------------------------------
-    # [4] 效能優化設定
+    # [4] 效能優化設定 (錯峰運算)
     # -----------------------------------------------------------
-    PROCESS_CYCLE: int = 4       
-    FRAME_TRAFFIC: int = 0       
-    FRAME_ROAD: int = 1          
-    FRAME_COMMON: int = 2        
-    QUEUE_MAX: int = 3           
+    # 維持 6 幀一個循環，讓 AI 運算分散開來
+    PROCESS_CYCLE: int = 6       
+    
+    # [排程表]
+    FRAME_TRAFFIC: int = 0      # AI: 紅綠燈
+    FRAME_GREEN: int = 1        # HSV: 綠色人行道 (快)
+    FRAME_COMMON: int = 2       # AI: 障礙物
+    FRAME_ZEBRA: int = 3        # AI: 斑馬線 (重頭戲)
+    FRAME_GREEN_2: int = 4      # HSV: 再補一次綠色 (確保流暢)
+    
+    QUEUE_MAX: int = 2 
     
     # -----------------------------------------------------------
-    # [5] 斑馬線/路徑顏色設定 (HSV)
+    # [5] 綠色人行道設定 (HSV)
     # -----------------------------------------------------------
     LOWER_GREEN: np.ndarray = field(default_factory=lambda: np.array([75, 40, 40]))   
     UPPER_GREEN: np.ndarray = field(default_factory=lambda: np.array([92, 255, 255])) 
@@ -85,8 +94,6 @@ class Config:
     TTS_INTERVAL: float = 15.0   
     MIN_OBS_HEIGHT: float = 0.6  
     
-    # [新增] 心跳聲間隔 (秒)
-    # 這是最後一道防線：如果使用者聽不到這個聲音，代表系統死當了
     HEARTBEAT_INTERVAL: float = 5.0
     
     # -----------------------------------------------------------
@@ -132,12 +139,15 @@ class TTSWorker(threading.Thread):
         try: self.engine.endLoop()
         except: pass
 
-    def speak(self, msg: str, key: str = "general", interval: float = 0, force: bool = False):
+    def speak(self, msg: str, key: str = "general", interval: float = 0, force: bool = False, clear_queue: bool = False):
         now = time.time()
         last_time = self.last_spoken_time.get(key, 0)
         last_msg = self.last_spoken_msg.get(key, "")
 
         if force or (msg != last_msg) or (now - last_time > interval):
+            if clear_queue:
+                with self.queue.mutex:
+                    self.queue.queue.clear()
             self.queue.put(msg)
             self.last_spoken_time[key] = now
             self.last_spoken_msg[key] = msg
@@ -146,7 +156,7 @@ class TTSWorker(threading.Thread):
         self.stop_event.set()
 
 # ==========================================
-# 3. 狀態管理模組
+# 3. 狀態管理模組 (支援雙路徑邏輯)
 # ==========================================
 class TrafficStateManager:
     def __init__(self, config: Config, tts: TTSWorker):
@@ -163,19 +173,15 @@ class TrafficStateManager:
         self.last_path_state = "NORMAL" 
         self.last_path_seen_time = time.time()
         self.system_start_time = time.time()
-        
-        # [新增] 心跳計時器
         self.last_heartbeat = time.time()
-        
         self.prev_light_tts = None
+        self.guidance_source = "NONE" # 紀錄現在是跟著誰走
 
-    def update(self, det_traffic, det_road, det_obstacle, frame_width):
+    def update(self, det_traffic, det_green, det_zebra, det_obstacle, frame_width):
         now = time.time()
         
-        # --- [防線 3] 心跳聲邏輯 (Heartbeat) ---
+        # 心跳聲 (維持有聲音)
         if now - self.last_heartbeat > self.cfg.HEARTBEAT_INTERVAL:
-            # 發出短促的「滴」聲，代表系統活著
-            # 如果覺得語音「滴」太慢，這行可以換成播放 wav 音效
             self.tts.speak("滴", key="heartbeat", interval=0, force=True)
             self.last_heartbeat = now
             
@@ -186,7 +192,8 @@ class TrafficStateManager:
                         "green" if self.lights["green"]["state"] else None
                         
         if current_light != "red": 
-            self._handle_path_guidance(det_road, frame_width)
+            # 傳入兩種路徑數據 (綠色 + 斑馬線)
+            self._handle_path_guidance(det_green, det_zebra, frame_width)
         
         self._trigger_tts(current_light, det_obstacle)
 
@@ -195,7 +202,6 @@ class TrafficStateManager:
             "green": detections.get("green_box"),
             "red": detections.get("red_box")
         }
-        
         self.countdown["box"] = detections.get("cnt_box")
 
         for key in ["green", "red"]:
@@ -228,39 +234,51 @@ class TrafficStateManager:
         
         self.countdown["last_digit"] = digit
 
-    def _handle_path_guidance(self, road_data, width):
-        pct = road_data.get("percentage", 0)
-        cx = road_data.get("cx", width // 2)
+    # ★★★ 雙路徑整合邏輯 ★★★
+    def _handle_path_guidance(self, green_data, zebra_data, width):
+        # 取得兩邊的信心度/面積
+        zebra_pct = zebra_data.get("percentage", 0)
+        green_pct = green_data.get("percentage", 0)
+        
+        target_cx = width // 2
         center_x = width // 2
+        current_pct = 0
         
-        is_warning_state = self.path_state in ["SHIFT_LEFT", "SHIFT_RIGHT"]
-        
-        if is_warning_state:
-            ratio_threshold = self.cfg.PATH_CENTER_RATIO - self.cfg.PATH_CENTER_BUFFER
+        # [優先級邏輯]
+        # 如果有斑馬線，優先跟隨斑馬線 (因為路口引導更重要)
+        if zebra_pct >= self.cfg.PATH_DEVIATION_TH:
+            self.guidance_source = "ZEBRA"
+            target_cx = zebra_data.get("cx", center_x)
+            current_pct = zebra_pct
+        elif green_pct >= self.cfg.PATH_DEVIATION_TH:
+            self.guidance_source = "GREEN"
+            target_cx = green_data.get("cx", center_x)
+            current_pct = green_pct
         else:
-            ratio_threshold = self.cfg.PATH_CENTER_RATIO
-            
-        limit_pixel = width * ratio_threshold
+            self.guidance_source = "NONE"
+            current_pct = 0
 
-        if self.path_state in ["OUT_OF_PATH", "NO_SIGNAL"]:
-            area_threshold = self.cfg.PATH_DEVIATION_TH + self.cfg.PATH_RETURN_BUFFER 
-        else:
-            area_threshold = self.cfg.PATH_DEVIATION_TH 
+        # --- 以下為通用引導邏輯 ---
+        is_warning_state = self.path_state in ["SHIFT_LEFT", "SHIFT_RIGHT"]
+        ratio_threshold = (self.cfg.PATH_CENTER_RATIO - self.cfg.PATH_CENTER_BUFFER) if is_warning_state else self.cfg.PATH_CENTER_RATIO
+        limit_pixel = width * ratio_threshold
+        
+        area_threshold = (self.cfg.PATH_DEVIATION_TH + self.cfg.PATH_RETURN_BUFFER) if self.path_state in ["OUT_OF_PATH", "NO_SIGNAL"] else self.cfg.PATH_DEVIATION_TH 
 
         current_state = "NORMAL"
         msg = ""
 
-        if pct >= area_threshold:
+        if current_pct >= area_threshold:
             self.last_path_seen_time = time.time()
-            if cx < center_x - limit_pixel:
+            if target_cx < center_x - limit_pixel:
                 current_state = "SHIFT_LEFT"
                 msg = "請向左修正"
-            elif cx > center_x + limit_pixel:
+            elif target_cx > center_x + limit_pixel:
                 current_state = "SHIFT_RIGHT"
                 msg = "請向右修正"
             else:
                 current_state = "NORMAL"
-                msg = "路徑正常"
+                msg = "" # 正常時閉嘴
         else:
             time_lost = time.time() - self.last_path_seen_time
             if time_lost > self.cfg.PATH_LOST_TIMEOUT:
@@ -279,11 +297,7 @@ class TrafficStateManager:
         state_changed = (current_state != self.last_path_state)
         
         if msg:
-            if current_state == "NORMAL":
-                if state_changed: 
-                    self.tts.speak(msg, key="path_guidance", force=True)
-            else:
-                self.tts.speak(msg, key="path_guidance", interval=self.cfg.REMIND_INTERVAL, force=state_changed)
+            self.tts.speak(msg, key="path_guidance", interval=self.cfg.REMIND_INTERVAL, force=state_changed, clear_queue=True)
 
         self.last_path_state = current_state
 
@@ -291,11 +305,11 @@ class TrafficStateManager:
         if current_light and current_light != self.prev_light_tts:
             if not self.countdown["active"] or self.countdown["value"] > 5:
                 msg = "紅燈請停下" if current_light == "red" else "綠燈可以走"
-                self.tts.speak(msg, key="light", force=True)
+                self.tts.speak(msg, key="light", force=True, clear_queue=True)
                 self.prev_light_tts = current_light
 
         if self.countdown["active"] and self.countdown["value"] == 10:
-            self.tts.speak("剩餘10秒", key="cnt_10", force=True)
+            self.tts.speak("剩餘10秒", key="cnt_10", force=True, clear_queue=True)
 
         if self.path_state == "NORMAL":
             if obstacles.get('vehicle', 0) > 0:
@@ -313,19 +327,21 @@ class TrafficStateManager:
         return boxes
 
 # ==========================================
-# 4. 影像偵測模組
+# 4. 影像偵測模組 (整合 AI 與 HSV)
 # ==========================================
 class TrafficDetector:
     def __init__(self, config: Config):
         self.cfg = config
         self._init_models()
-        try: cv2.setNumThreads(1); import torch; torch.set_num_threads(1)
-        except: pass
+        # 不限制執行緒，讓效能全開
 
     def _init_models(self):
         print(f"正在載入模型...")
         self.model_traffic = YOLO(self.cfg.MODEL_TRAFFIC)
-        self.model_road = YOLO(self.cfg.MODEL_ROAD)
+        
+        # 載入斑馬線模型 (best.pt)
+        self.model_zebra = YOLO(self.cfg.MODEL_ZEBRA) 
+        
         self.model_common = YOLO(self.cfg.MODEL_COMMON)
         try: 
             if load_model: self.cnn = load_model(self.cfg.MODEL_CNN)
@@ -374,7 +390,8 @@ class TrafficDetector:
         except: pass
         return None
 
-    def detect_road(self, frame):
+    # 功能 1: 綠色人行道 (HSV - 快速)
+    def detect_green_path(self, frame):
         res = {"percentage": 0, "cx": frame.shape[1]//2, "contours": []}
         h, w = frame.shape[:2]
         try:
@@ -397,16 +414,43 @@ class TrafficDetector:
         except Exception: pass
         return res
 
+    # 功能 2: 斑馬線 (AI - 準確但重)
+    def detect_zebra(self, frame):
+        res = {"percentage": 0, "cx": frame.shape[1]//2, "box": None}
+        h, w = frame.shape[:2]
+        try:
+            # 呼叫 AI 模型 (best.pt)
+            results = self.model_zebra(frame, imgsz=self.cfg.IMGSZ_ZEBRA, conf=self.cfg.CONF_ZEBRA, verbose=False)
+            
+            best_box = None
+            max_area = 0
+            
+            for r in results:
+                for box in r.boxes.xyxy.cpu().numpy():
+                    x1, y1, x2, y2 = map(int, box)
+                    area = (x2 - x1) * (y2 - y1)
+                    
+                    if area > max_area:
+                        max_area = area
+                        best_box = (x1, y1, x2, y2)
+            
+            if best_box:
+                x1, y1, x2, y2 = best_box
+                res["percentage"] = (max_area / (w * h)) * 100
+                res["cx"] = (x1 + x2) // 2
+                res["box"] = best_box 
+
+        except Exception as e:
+            print(f"Zebra Det Error: {e}")
+        return res
+
     def detect_obstacles(self, frame):
-        # 為了畫面乾淨，這邊暫時保留偵測但不回傳任何框
-        # 這樣就不會畫出白框了
         return {"person": 0, "vehicle": 0, "boxes": []}
 
 # ==========================================
-# 5. 主程式入口 (含防線 1：例外處理)
+# 5. 主程式入口
 # ==========================================
 def main():
-    # [防線 1] 緊急語音函式 (當程式死掉時，做最後的掙扎)
     def emergency_speak(text):
         try:
             eng = pyttsx3.init()
@@ -461,9 +505,11 @@ def main():
         cv2.namedWindow("Smart Guide", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Smart Guide", 1024, 768)
         
+        # 快取空間 (含綠色與斑馬線)
         cache = {
             "traffic": {}, 
-            "road": {"percentage": 0, "cx": 0, "contours": []}, 
+            "green_path": {"percentage": 0, "cx": 0, "contours": []},
+            "zebra": {"percentage": 0, "cx": 0, "box": None},
             "obs": {"boxes": [], "person": 0, "vehicle": 0}
         }
         
@@ -477,21 +523,43 @@ def main():
             cycle = idx % cfg.PROCESS_CYCLE
             idx += 1
             
+            # [排程邏輯] 分散運算
             if cycle == cfg.FRAME_TRAFFIC:
                 cache["traffic"] = detector.detect_traffic(frame, state_mgr.cnn_enabled)
-            elif cycle == cfg.FRAME_ROAD:
-                cache["road"] = detector.detect_road(frame)
+                
+            elif cycle == cfg.FRAME_GREEN or cycle == cfg.FRAME_GREEN_2:
+                # 跑兩次綠色 (因為它快)
+                cache["green_path"] = detector.detect_green_path(frame)
+                
+            elif cycle == cfg.FRAME_ZEBRA:
+                # 跑一次斑馬線 (因為它重)
+                cache["zebra"] = detector.detect_zebra(frame)
+                
             elif cycle == cfg.FRAME_COMMON:
                 cache["obs"] = detector.detect_obstacles(frame)
             
-            state_mgr.update(cache["traffic"], cache["road"], cache["obs"], frame.shape[1])
+            state_mgr.update(cache["traffic"], cache["green_path"], cache["zebra"], cache["obs"], frame.shape[1])
             
-            # --- 畫面繪製 (含防閃退 try-catch) ---
+            # --- 畫面繪製 ---
             try:
-                if cache["road"]["contours"]:
-                    cv2.drawContours(frame, cache["road"]["contours"], -1, (0, 255, 0), 2)
-                    if cache["road"]["cx"] > 0:
-                        cv2.circle(frame, (cache["road"]["cx"], frame.shape[0]//2), 10, (0, 0, 255), -1)
+                # 1. 畫綠色人行道 (輪廓)
+                if cache["green_path"]["contours"]:
+                    cv2.drawContours(frame, cache["green_path"]["contours"], -1, (0, 255, 0), 2)
+                
+                # 2. 畫斑馬線 (粉紅框)
+                if cache["zebra"]["box"] is not None:
+                    zx1, zy1, zx2, zy2 = cache["zebra"]["box"]
+                    cv2.rectangle(frame, (zx1, zy1), (zx2, zy2), (255, 0, 255), 3) 
+                    cv2.putText(frame, "Zebra", (zx1, zy1-10), 0, 0.7, (255, 0, 255), 2)
+                
+                # 顯示目前跟隨的目標點
+                target_cx = 0
+                if state_mgr.guidance_source == "ZEBRA":
+                    target_cx = cache["zebra"]["cx"]
+                    cv2.circle(frame, (target_cx, frame.shape[0]//2), 15, (255, 0, 255), -1) 
+                elif state_mgr.guidance_source == "GREEN":
+                    target_cx = cache["green_path"]["cx"]
+                    cv2.circle(frame, (target_cx, frame.shape[0]//2), 10, (0, 255, 0), -1) 
                 
                 roi_y = int(frame.shape[0] * cfg.ROAD_ROI_TOP)
                 cv2.line(frame, (0, roi_y), (frame.shape[1], roi_y), (100, 100, 100), 1)
@@ -502,32 +570,32 @@ def main():
                     cv2.rectangle(frame, (x1,y1), (x2,y2), color, 3)
                     cv2.putText(frame, label, (x1,y1-10), 0, 0.7, color, 2)
                     
-                # 障礙物框已在 detect_obstacles 停用，這裡不會畫出東西
-                    
                 if state_mgr.countdown["active"]:
                     cv2.putText(frame, f"CNT: {state_mgr.countdown['value']}", (30,80), 0, 2, (0,255,255), 3)
                 
-                cv2.putText(frame, f"Path: {state_mgr.path_state} ({cache['road']['percentage']:.1f}%)", (30, 40), 0, 0.8, (255,255,0), 2)
+                # 顯示狀態
+                status_text = f"Path: {state_mgr.path_state}"
+                if state_mgr.guidance_source != "NONE":
+                    status_text += f" [{state_mgr.guidance_source}]"
+                cv2.putText(frame, status_text, (30, 40), 0, 0.8, (255,255,0), 2)
 
                 cv2.imshow("Smart Guide", frame)
             
             except Exception as draw_err:
                 print(f"Drawing Error: {draw_err}") 
 
-            # --- 按鍵控制 (測試用) ---
             key = cv2.waitKey(delay_time) & 0xFF
             
-            if key == ord('q'): # 正常離開
+            if key == ord('q'): 
                 print("使用者手動退出。")
-                # 強制回傳 0 (代表正常)，這樣看門狗就不會重啟
-                os._exit(0)
+                os._exit(0) 
                 
-            elif key == ord('k'): # 模擬「崩潰 (Crash)」-> 測試自動重啟
+            elif key == ord('k'): 
                 print("\n[測試] 3秒後模擬程式崩潰...")
                 time.sleep(1) 
                 raise RuntimeError("這是手動觸發的測試崩潰！")
 
-            elif key == ord('f'): # 模擬「死當 (Freeze)」-> 測試心跳聲消失
+            elif key == ord('f'): 
                 print("\n[測試] 系統模擬死當 (無限迴圈)...")
                 while True:
                     time.sleep(1) 
@@ -541,9 +609,7 @@ def main():
         print("❌ 程式發生錯誤 (CRASHED)")
         print(f"錯誤訊息: {e}")
         print("="*40)
-        # [防線 1] 程式死前講最後一句話
         emergency_speak("系統錯誤，請原地停止") 
-        # 讓 exit code 不為 0，通知外部看門狗
         os._exit(1)
 
 if __name__ == "__main__":
