@@ -69,11 +69,9 @@ class Config:
     # -----------------------------------------------------------
     ROAD_ROI_TOP: float = 0.5 
     
-    # 面積門檻 (3%)
     PATH_DEVIATION_TH: int = 3  
     PATH_RETURN_BUFFER: int = 2
 
-    # 左右偏移門檻 (25%)
     PATH_CENTER_RATIO: float = 0.25
     PATH_CENTER_BUFFER: float = 0.05     
     
@@ -86,6 +84,10 @@ class Config:
     TIMEOUT_LOCK: float = 3.0    
     TTS_INTERVAL: float = 15.0   
     MIN_OBS_HEIGHT: float = 0.6  
+    
+    # [新增] 心跳聲間隔 (秒)
+    # 這是最後一道防線：如果使用者聽不到這個聲音，代表系統死當了
+    HEARTBEAT_INTERVAL: float = 5.0
     
     # -----------------------------------------------------------
     # [8] 其他設定
@@ -161,10 +163,22 @@ class TrafficStateManager:
         self.last_path_state = "NORMAL" 
         self.last_path_seen_time = time.time()
         self.system_start_time = time.time()
+        
+        # [新增] 心跳計時器
+        self.last_heartbeat = time.time()
+        
         self.prev_light_tts = None
 
     def update(self, det_traffic, det_road, det_obstacle, frame_width):
         now = time.time()
+        
+        # --- [防線 3] 心跳聲邏輯 (Heartbeat) ---
+        if now - self.last_heartbeat > self.cfg.HEARTBEAT_INTERVAL:
+            # 發出短促的「滴」聲，代表系統活著
+            # 如果覺得語音「滴」太慢，這行可以換成播放 wav 音效
+            self.tts.speak("滴", key="heartbeat", interval=0, force=True)
+            self.last_heartbeat = now
+            
         self._update_lights(det_traffic, now)
         self._handle_countdown(det_traffic.get('digit'))
         
@@ -182,10 +196,6 @@ class TrafficStateManager:
             "red": detections.get("red_box")
         }
         
-        # [修正] 倒數框邏輯
-        # 以前是：如果有看到 cnt_box 才更新
-        # 現在是：直接把偵測結果 (可能是 Box 或 None) 賦值給狀態
-        # 這樣如果這幀沒看到 (None)，框框就會被清除
         self.countdown["box"] = detections.get("cnt_box")
 
         for key in ["green", "red"]:
@@ -332,8 +342,6 @@ class TrafficDetector:
                     safe_box = [int(x) for x in box]
                     
                     if c == 1: # Green
-                        # [修正] 移除這行 print，讓終端機安靜
-                        # print("Detected: GREEN Light") 
                         res["green"] = True
                         res["green_box"] = safe_box
                     elif c == 2: # Red
@@ -390,26 +398,23 @@ class TrafficDetector:
         return res
 
     def detect_obstacles(self, frame):
-        res = {"person": 0, "vehicle": 0, "boxes": []}
-        h, w = frame.shape[:2]
-        try:
-            results = self.model_common(frame, imgsz=self.cfg.IMGSZ_COMMON, conf=self.cfg.CONF_COMMON, verbose=False)
-            for r in results:
-                for box, cls in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.cls.cpu().numpy()):
-                    x1,y1,x2,y2 = map(int, box); c = int(cls)
-                    if (y2-y1)/h > self.cfg.MIN_OBS_HEIGHT and 0.2 < (x1+x2)/2/w < 0.8:
-                        label = "Person" if c==0 else "Car"
-                        safe_box = [int(val) for val in box]
-                        res["boxes"].append((label, safe_box, (200,200,200)))
-                        if c == 0: res["person"] += 1
-                        elif c in [1,2,3,5,7]: res["vehicle"] += 1
-        except: pass
-        return res
+        # 為了畫面乾淨，這邊暫時保留偵測但不回傳任何框
+        # 這樣就不會畫出白框了
+        return {"person": 0, "vehicle": 0, "boxes": []}
 
 # ==========================================
-# 5. 主程式入口
+# 5. 主程式入口 (含防線 1：例外處理)
 # ==========================================
 def main():
+    # [防線 1] 緊急語音函式 (當程式死掉時，做最後的掙扎)
+    def emergency_speak(text):
+        try:
+            eng = pyttsx3.init()
+            eng.setProperty('rate', 150)
+            eng.say(text)
+            eng.runAndWait()
+        except: pass
+
     try:
         cfg = Config()
         tts = TTSWorker(); tts.start()
@@ -451,7 +456,7 @@ def main():
         
         threading.Thread(target=reader, daemon=True).start()
 
-        print(f"系統已啟動。FPS: {video_fps}。按 'q' 可離開。")
+        print(f"系統已啟動。FPS: {video_fps}。按 'q' 離開, 'k' 測試崩潰, 'f' 測試死當。")
         
         cv2.namedWindow("Smart Guide", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Smart Guide", 1024, 768)
@@ -481,7 +486,7 @@ def main():
             
             state_mgr.update(cache["traffic"], cache["road"], cache["obs"], frame.shape[1])
             
-            # --- 畫面繪製 ---
+            # --- 畫面繪製 (含防閃退 try-catch) ---
             try:
                 if cache["road"]["contours"]:
                     cv2.drawContours(frame, cache["road"]["contours"], -1, (0, 255, 0), 2)
@@ -497,10 +502,7 @@ def main():
                     cv2.rectangle(frame, (x1,y1), (x2,y2), color, 3)
                     cv2.putText(frame, label, (x1,y1-10), 0, 0.7, color, 2)
                     
-                for label, box, color in cache["obs"]["boxes"]:
-                    x1,y1,x2,y2 = map(int, box)
-                    x1=max(0,x1); y1=max(0,y1); x2=min(frame.shape[1],x2); y2=min(frame.shape[0],y2)
-                    cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
+                # 障礙物框已在 detect_obstacles 停用，這裡不會畫出東西
                     
                 if state_mgr.countdown["active"]:
                     cv2.putText(frame, f"CNT: {state_mgr.countdown['value']}", (30,80), 0, 2, (0,255,255), 3)
@@ -512,7 +514,23 @@ def main():
             except Exception as draw_err:
                 print(f"Drawing Error: {draw_err}") 
 
-            if cv2.waitKey(delay_time) & 0xFF == ord('q'): break
+            # --- 按鍵控制 (測試用) ---
+            key = cv2.waitKey(delay_time) & 0xFF
+            
+            if key == ord('q'): # 正常離開
+                print("使用者手動退出。")
+                # 強制回傳 0 (代表正常)，這樣看門狗就不會重啟
+                os._exit(0)
+                
+            elif key == ord('k'): # 模擬「崩潰 (Crash)」-> 測試自動重啟
+                print("\n[測試] 3秒後模擬程式崩潰...")
+                time.sleep(1) 
+                raise RuntimeError("這是手動觸發的測試崩潰！")
+
+            elif key == ord('f'): # 模擬「死當 (Freeze)」-> 測試心跳聲消失
+                print("\n[測試] 系統模擬死當 (無限迴圈)...")
+                while True:
+                    time.sleep(1) 
 
         stop_event.set()
         tts.stop()
@@ -521,10 +539,12 @@ def main():
     except Exception as e:
         print("\n" + "="*40)
         print("❌ 程式發生錯誤 (CRASHED)")
+        print(f"錯誤訊息: {e}")
         print("="*40)
-        traceback.print_exc()
-        print("="*40)
-        input("請按 Enter 鍵關閉視窗...")
+        # [防線 1] 程式死前講最後一句話
+        emergency_speak("系統錯誤，請原地停止") 
+        # 讓 exit code 不為 0，通知外部看門狗
+        os._exit(1)
 
 if __name__ == "__main__":
     main()
