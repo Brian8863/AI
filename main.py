@@ -5,15 +5,17 @@ import threading
 import queue
 import time
 import traceback
+import gc
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List
 
-# 設定環境變數
+# 設定環境變數：隱藏 TensorFlow 的除錯訊息
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 
 from ultralytics import YOLO
 try:
     from tensorflow.keras.models import load_model 
+    import tensorflow as tf
 except ImportError:
     print("警告: 找不到 TensorFlow，將停用 CNN 數字辨識功能。")
     load_model = None
@@ -28,42 +30,41 @@ class Config:
     # -----------------------------------------------------------
     # [1] 檔案路徑設定
     # -----------------------------------------------------------
-    VIDEO_PATH: any = 1  
+    # 0 或 1 代表 Webcam
+    VIDEO_PATH: any = 2 
+    
+    # ★ 旋轉設定：直拍請設 True，橫拍請設 False
+    NEED_ROTATION: bool = True 
+    
     MODEL_TRAFFIC: str = "Model/traffic&count.pt" 
-    
-    # ★ 恢復斑馬線模型 (原本叫 MODEL_ROAD，現在正名為 MODEL_ZEBRA)
-    MODEL_ZEBRA: str = "Model/zebra.pt"            
-    
-    MODEL_COMMON: str = "Model/yolov8n.pt"       
+    MODEL_ZEBRA: str = "Model/zebra_v3.pt"            
     MODEL_CNN: str = "Model/cnn_digit_model_new.h5" 
     
     # -----------------------------------------------------------
-    # [2] 解析度設定 (維持高效能設定)
+    # [2] 解析度設定
     # -----------------------------------------------------------
-    IMGSZ_TRAFFIC: int = 640    # 紅綠燈 (降解析度求順暢)
-    IMGSZ_ZEBRA: int = 640      # 斑馬線
-    IMGSZ_COMMON: int = 320     # 障礙物
+    IMGSZ_TRAFFIC: int = 960    
+    IMGSZ_ZEBRA: int = 640      
     
     # -----------------------------------------------------------
     # [3] 信心門檻
     # -----------------------------------------------------------
-    CONF_TRAFFIC: float = 0.5    
-    CONF_ZEBRA: float = 0.25     
-    CONF_COMMON: float = 0.5     
+    CONF_TRAFFIC: float = 0.7    
+    CONF_ZEBRA: float = 0.5     
     CONF_CNN: float = 0.7        
     
     # -----------------------------------------------------------
     # [4] 效能優化設定 (錯峰運算)
     # -----------------------------------------------------------
-    # 維持 6 幀一個循環，讓 AI 運算分散開來
-    PROCESS_CYCLE: int = 6       
+    PROCESS_CYCLE: int = 5       
     
-    # [排程表]
-    FRAME_TRAFFIC: int = 0      # AI: 紅綠燈
-    FRAME_GREEN: int = 1        # HSV: 綠色人行道 (快)
-    FRAME_COMMON: int = 2       # AI: 障礙物
-    FRAME_ZEBRA: int = 3        # AI: 斑馬線 (重頭戲)
-    FRAME_GREEN_2: int = 4      # HSV: 再補一次綠色 (確保流暢)
+    FRAME_TRAFFIC: int = 0      
+    FRAME_GREEN: int = 1        
+    FRAME_ZEBRA: int = 2        
+    FRAME_GREEN_2: int = 3      
+    FRAME_REST: int = 4         
+    
+    FRAME_COMMON: int = -1      
     
     QUEUE_MAX: int = 2 
     
@@ -74,25 +75,33 @@ class Config:
     UPPER_GREEN: np.ndarray = field(default_factory=lambda: np.array([92, 255, 255])) 
     
     # -----------------------------------------------------------
-    # [6] 路徑引導靈敏度
+    # [6] 路徑引導靈敏度 (★ 關鍵修正區域)
     # -----------------------------------------------------------
     ROAD_ROI_TOP: float = 0.5 
+    IGNORE_BOTTOM_RATIO: float = 0.1 
     
     PATH_DEVIATION_TH: int = 3  
     PATH_RETURN_BUFFER: int = 2
 
-    PATH_CENTER_RATIO: float = 0.25
+    # ★ 修正 1：放寬安全區 (原本 0.25 -> 改 0.40)
+    # 讓中間 40% 的區域都算「直走」，減少左右修正的語音干擾
+    PATH_CENTER_RATIO: float = 0.40
     PATH_CENTER_BUFFER: float = 0.05     
+    
+    # ★ 修正 2：新增「斑馬線最小面積門檻」
+    # 原本是寫死 0.5%，現在改用參數控制，設為 1.5%
+    # 只有看到夠大塊的斑馬線才開始導航，過濾小白點
+    ZEBRA_MIN_AREA: float = 1.5
     
     # -----------------------------------------------------------
     # [7] 語音與邏輯控制
     # -----------------------------------------------------------
     STARTUP_GRACE_PERIOD: float = 5.0
-    PATH_LOST_TIMEOUT: float = 5.0
+    PATH_LOST_TIMEOUT: float = 3.0   
+    ZEBRA_LOCK_TIMEOUT: float = 2.0 
+    
     REMIND_INTERVAL: float = 8.0 
     TIMEOUT_LOCK: float = 3.0    
-    TTS_INTERVAL: float = 15.0   
-    MIN_OBS_HEIGHT: float = 0.6  
     
     HEARTBEAT_INTERVAL: float = 5.0
     
@@ -130,7 +139,7 @@ class TTSWorker(threading.Thread):
                 self.engine.iterate() 
                 try:
                     msg = self.queue.get_nowait()
-                    print(f"🔊 [語音]: {msg}")
+                    # print(f"🔊 [語音]: {msg}")
                     self.engine.say(msg)
                 except queue.Empty:
                     pass
@@ -156,7 +165,7 @@ class TTSWorker(threading.Thread):
         self.stop_event.set()
 
 # ==========================================
-# 3. 狀態管理模組 (支援雙路徑邏輯)
+# 3. 狀態管理模組
 # ==========================================
 class TrafficStateManager:
     def __init__(self, config: Config, tts: TTSWorker):
@@ -175,12 +184,15 @@ class TrafficStateManager:
         self.system_start_time = time.time()
         self.last_heartbeat = time.time()
         self.prev_light_tts = None
-        self.guidance_source = "NONE" # 紀錄現在是跟著誰走
+        self.guidance_source = "NONE" 
+        
+        self.smoothed_cx = None
+        self.last_zebra_time = 0 
 
-    def update(self, det_traffic, det_green, det_zebra, det_obstacle, frame_width):
+    def update(self, det_traffic, det_green, det_zebra, frame_width):
         now = time.time()
         
-        # 心跳聲 (維持有聲音)
+        # 心跳聲
         if now - self.last_heartbeat > self.cfg.HEARTBEAT_INTERVAL:
             self.tts.speak("滴", key="heartbeat", interval=0, force=True)
             self.last_heartbeat = now
@@ -192,10 +204,9 @@ class TrafficStateManager:
                         "green" if self.lights["green"]["state"] else None
                         
         if current_light != "red": 
-            # 傳入兩種路徑數據 (綠色 + 斑馬線)
-            self._handle_path_guidance(det_green, det_zebra, frame_width)
+            self._handle_path_guidance(det_green, det_zebra, frame_width, now)
         
-        self._trigger_tts(current_light, det_obstacle)
+        self._trigger_tts(current_light)
 
     def _update_lights(self, detections, now):
         current_boxes = {
@@ -234,64 +245,67 @@ class TrafficStateManager:
         
         self.countdown["last_digit"] = digit
 
-    # ★★★ 雙路徑整合邏輯 ★★★
-    def _handle_path_guidance(self, green_data, zebra_data, width):
-        # 取得兩邊的信心度/面積
+    def _handle_path_guidance(self, green_data, zebra_data, width, now):
         zebra_pct = zebra_data.get("percentage", 0)
         green_pct = green_data.get("percentage", 0)
         
         target_cx = width // 2
         center_x = width // 2
-        current_pct = 0
         
-        # [優先級邏輯]
-        # 如果有斑馬線，優先跟隨斑馬線 (因為路口引導更重要)
-        if zebra_pct >= self.cfg.PATH_DEVIATION_TH:
-            self.guidance_source = "ZEBRA"
-            target_cx = zebra_data.get("cx", center_x)
-            current_pct = zebra_pct
+        new_guidance_source = "NONE"
+
+        # ★★★ 修正重點：使用 ZEBRA_MIN_AREA 取代原本的 0.5 ★★★
+        if zebra_pct >= self.cfg.ZEBRA_MIN_AREA: 
+            new_guidance_source = "ZEBRA"
+            raw_target_cx = zebra_data.get("cx", center_x)
+            self.last_zebra_time = now 
+        elif (now - self.last_zebra_time) < self.cfg.ZEBRA_LOCK_TIMEOUT:
+            new_guidance_source = "WAITING_ZEBRA" 
+            raw_target_cx = self.smoothed_cx if self.smoothed_cx else center_x
         elif green_pct >= self.cfg.PATH_DEVIATION_TH:
-            self.guidance_source = "GREEN"
-            target_cx = green_data.get("cx", center_x)
-            current_pct = green_pct
+            new_guidance_source = "GREEN"
+            raw_target_cx = green_data.get("cx", center_x)
         else:
-            self.guidance_source = "NONE"
-            current_pct = 0
+            new_guidance_source = "NONE"
+            raw_target_cx = center_x
 
-        # --- 以下為通用引導邏輯 ---
-        is_warning_state = self.path_state in ["SHIFT_LEFT", "SHIFT_RIGHT"]
-        ratio_threshold = (self.cfg.PATH_CENTER_RATIO - self.cfg.PATH_CENTER_BUFFER) if is_warning_state else self.cfg.PATH_CENTER_RATIO
-        limit_pixel = width * ratio_threshold
+        self.guidance_source = new_guidance_source
         
-        area_threshold = (self.cfg.PATH_DEVIATION_TH + self.cfg.PATH_RETURN_BUFFER) if self.path_state in ["OUT_OF_PATH", "NO_SIGNAL"] else self.cfg.PATH_DEVIATION_TH 
+        # 平滑處理
+        if new_guidance_source in ["ZEBRA", "GREEN"]:
+            if self.smoothed_cx is None:
+                self.smoothed_cx = raw_target_cx
+            else:
+                self.smoothed_cx = int(self.smoothed_cx * 0.7 + raw_target_cx * 0.3)
+            target_cx = self.smoothed_cx
+        elif new_guidance_source == "WAITING_ZEBRA":
+             target_cx = self.smoothed_cx if self.smoothed_cx else center_x
+        else:
+            target_cx = center_x
 
+        limit_pixel = width * self.cfg.PATH_CENTER_RATIO
         current_state = "NORMAL"
         msg = ""
 
-        if current_pct >= area_threshold:
-            self.last_path_seen_time = time.time()
+        if new_guidance_source in ["ZEBRA", "GREEN"]:
+            self.last_path_seen_time = now
             if target_cx < center_x - limit_pixel:
                 current_state = "SHIFT_LEFT"
                 msg = "請向左修正"
             elif target_cx > center_x + limit_pixel:
                 current_state = "SHIFT_RIGHT"
                 msg = "請向右修正"
-            else:
-                current_state = "NORMAL"
-                msg = "" # 正常時閉嘴
         else:
-            time_lost = time.time() - self.last_path_seen_time
-            if time_lost > self.cfg.PATH_LOST_TIMEOUT:
+            if now - self.last_path_seen_time > self.cfg.PATH_LOST_TIMEOUT:
                 current_state = "NO_SIGNAL"
-                msg = "" 
+            elif now - self.system_start_time < self.cfg.STARTUP_GRACE_PERIOD:
+                current_state = "SEARCHING" 
             else:
-                time_since_boot = time.time() - self.system_start_time
-                if time_since_boot < self.cfg.STARTUP_GRACE_PERIOD:
-                    current_state = "SEARCHING" 
-                    msg = "" 
-                else:
-                    current_state = "OUT_OF_PATH"
-                    msg = "警告，偏離路徑"
+                current_state = "OUT_OF_PATH"
+                if new_guidance_source != "WAITING_ZEBRA":
+                    # 智慧靜音
+                    if self.last_path_state == "NORMAL": msg = ""
+                    elif self.last_path_state in ["SHIFT_LEFT", "SHIFT_RIGHT"]: msg = "警告，偏離路徑"
 
         self.path_state = current_state 
         state_changed = (current_state != self.last_path_state)
@@ -301,7 +315,7 @@ class TrafficStateManager:
 
         self.last_path_state = current_state
 
-    def _trigger_tts(self, current_light, obstacles):
+    def _trigger_tts(self, current_light):
         if current_light and current_light != self.prev_light_tts:
             if not self.countdown["active"] or self.countdown["value"] > 5:
                 msg = "紅燈請停下" if current_light == "red" else "綠燈可以走"
@@ -310,12 +324,6 @@ class TrafficStateManager:
 
         if self.countdown["active"] and self.countdown["value"] == 10:
             self.tts.speak("剩餘10秒", key="cnt_10", force=True, clear_queue=True)
-
-        if self.path_state == "NORMAL":
-            if obstacles.get('vehicle', 0) > 0:
-                self.tts.speak("前方有車", key="obs", interval=self.cfg.TTS_INTERVAL)
-            elif obstacles.get('person', 0) > 0:
-                self.tts.speak("小心行人", key="obs", interval=self.cfg.TTS_INTERVAL)
 
     def get_draw_info(self):
         boxes = []
@@ -327,22 +335,17 @@ class TrafficStateManager:
         return boxes
 
 # ==========================================
-# 4. 影像偵測模組 (整合 AI 與 HSV)
+# 4. 影像偵測模組
 # ==========================================
 class TrafficDetector:
     def __init__(self, config: Config):
         self.cfg = config
         self._init_models()
-        # 不限制執行緒，讓效能全開
 
     def _init_models(self):
         print(f"正在載入模型...")
         self.model_traffic = YOLO(self.cfg.MODEL_TRAFFIC)
-        
-        # 載入斑馬線模型 (best.pt)
         self.model_zebra = YOLO(self.cfg.MODEL_ZEBRA) 
-        
-        self.model_common = YOLO(self.cfg.MODEL_COMMON)
         try: 
             if load_model: self.cnn = load_model(self.cfg.MODEL_CNN)
             else: self.cnn = None
@@ -385,12 +388,17 @@ class TrafficDetector:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             _, th = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
             resized = cv2.resize(th, (28, 28)) / 255.0
-            pred = self.cnn.predict(resized.reshape(1,28,28,1), verbose=0)
+            
+            # 使用 call/invoke 方式而非 .predict() 以避免 Graph 堆積
+            input_tensor = resized.reshape(1, 28, 28, 1)
+            pred_tensor = self.cnn(input_tensor, training=False)
+            pred = pred_tensor.numpy()
+            
             if np.max(pred) > self.cfg.CONF_CNN: return np.argmax(pred)
-        except: pass
+        except Exception as e:
+            pass
         return None
 
-    # 功能 1: 綠色人行道 (HSV - 快速)
     def detect_green_path(self, frame):
         res = {"percentage": 0, "cx": frame.shape[1]//2, "contours": []}
         h, w = frame.shape[:2]
@@ -398,8 +406,9 @@ class TrafficDetector:
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask_green = cv2.inRange(hsv, self.cfg.LOWER_GREEN, self.cfg.UPPER_GREEN)
             
-            roi_height = int(h * self.cfg.ROAD_ROI_TOP)
-            mask_green[0:roi_height, :] = 0
+            mask_green[0:int(h * self.cfg.ROAD_ROI_TOP), :] = 0
+            if self.cfg.IGNORE_BOTTOM_RATIO > 0:
+                mask_green[int(h * (1 - self.cfg.IGNORE_BOTTOM_RATIO)):, :] = 0
             
             contours, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
@@ -414,38 +423,68 @@ class TrafficDetector:
         except Exception: pass
         return res
 
-    # 功能 2: 斑馬線 (AI - 準確但重)
     def detect_zebra(self, frame):
-        res = {"percentage": 0, "cx": frame.shape[1]//2, "box": None}
+        res = {"percentage": 0, "cx": frame.shape[1]//2, "masks_list": [], "box": None}
         h, w = frame.shape[:2]
         try:
-            # 呼叫 AI 模型 (best.pt)
-            results = self.model_zebra(frame, imgsz=self.cfg.IMGSZ_ZEBRA, conf=self.cfg.CONF_ZEBRA, verbose=False)
+            ai_input = frame.copy()
+            if self.cfg.IGNORE_BOTTOM_RATIO > 0:
+                ai_input[int(h * (1 - self.cfg.IGNORE_BOTTOM_RATIO)):, :] = 0
             
-            best_box = None
-            max_area = 0
+            results = self.model_zebra(ai_input, imgsz=self.cfg.IMGSZ_ZEBRA, conf=self.cfg.CONF_ZEBRA, 
+                                     verbose=False, retina_masks=True)
+            r = results[0]
             
-            for r in results:
+            # 模式 A: 分割 (Mask)
+            if r.masks is not None:
+                all_masks_points = r.masks.xy
+                total_area = 0
+                weighted_cx = 0
+                for points in all_masks_points:
+                    if len(points) > 0:
+                        ys = points[:, 1]
+                        if np.min(ys) < h * self.cfg.ROAD_ROI_TOP: continue 
+                        pts = points.astype(np.int32)
+                        rect = cv2.minAreaRect(pts)
+                        (center), (r_w, r_h), angle = rect
+                        if r_w == 0 or r_h == 0: continue
+                        aspect_ratio = max(r_w, r_h) / min(r_w, r_h)
+                        if aspect_ratio < 1.5: continue 
+                        area = cv2.contourArea(pts)
+                        if area < 800: continue
+                        res["masks_list"].append(pts)
+                        total_area += area
+                        M = cv2.moments(pts)
+                        if M["m00"] != 0:
+                            cx = int(M["m10"] / M["m00"])
+                            weighted_cx += cx * area
+                if total_area > 0:
+                    res["percentage"] = (total_area / (w * h)) * 100
+                    res["cx"] = int(weighted_cx / total_area)
+            
+            # 模式 B: 偵測 (Box) - 沒Mask時才用
+            if not res["masks_list"] and r.boxes is not None:
+                max_area = 0
+                best_box = None
                 for box in r.boxes.xyxy.cpu().numpy():
                     x1, y1, x2, y2 = map(int, box)
+                    if y1 < h * self.cfg.ROAD_ROI_TOP: continue
                     area = (x2 - x1) * (y2 - y1)
-                    
                     if area > max_area:
                         max_area = area
                         best_box = (x1, y1, x2, y2)
-            
-            if best_box:
-                x1, y1, x2, y2 = best_box
-                res["percentage"] = (max_area / (w * h)) * 100
-                res["cx"] = (x1 + x2) // 2
-                res["box"] = best_box 
+                
+                if best_box:
+                    res["box"] = best_box
+                    res["percentage"] = (max_area / (w * h)) * 100
+                    res["cx"] = (best_box[0] + best_box[2]) // 2
 
         except Exception as e:
             print(f"Zebra Det Error: {e}")
         return res
 
     def detect_obstacles(self, frame):
-        return {"person": 0, "vehicle": 0, "boxes": []}
+        return {"person": 0, "vehicle": 0}
 
 # ==========================================
 # 5. 主程式入口
@@ -472,6 +511,7 @@ def main():
         
         video_fps = cap.get(cv2.CAP_PROP_FPS)
         if video_fps == 0 or np.isnan(video_fps): video_fps = 30
+        
         delay_time = int(1000 / video_fps) 
         
         frame_q = queue.Queue(maxsize=cfg.QUEUE_MAX)
@@ -480,6 +520,11 @@ def main():
         def reader():
             is_video_file = isinstance(vid_src, str)
             while not stop_event.is_set():
+                if frame_q.full():
+                    time.sleep(0.01) 
+                    try: frame_q.get_nowait() 
+                    except: pass
+                
                 ret, f = cap.read()
                 if not ret: 
                     if cfg.LOOP_VIDEO and is_video_file:
@@ -489,28 +534,24 @@ def main():
                         frame_q.put(None)
                         break
                 
-                if is_video_file:
-                    frame_q.put(f) 
-                else:
-                    if frame_q.full(): 
-                        try: frame_q.get_nowait() 
-                        except: pass
-                    frame_q.put(f)
+                if cfg.NEED_ROTATION:
+                    f = cv2.rotate(f, cv2.ROTATE_90_CLOCKWISE)
+
+                try: frame_q.put(f, timeout=0.01)
+                except: pass
             cap.release()
         
         threading.Thread(target=reader, daemon=True).start()
 
-        print(f"系統已啟動。FPS: {video_fps}。按 'q' 離開, 'k' 測試崩潰, 'f' 測試死當。")
+        print(f"系統已啟動。FPS: {video_fps}。按 'q' 離開。")
         
         cv2.namedWindow("Smart Guide", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Smart Guide", 1024, 768)
         
-        # 快取空間 (含綠色與斑馬線)
         cache = {
             "traffic": {}, 
             "green_path": {"percentage": 0, "cx": 0, "contours": []},
-            "zebra": {"percentage": 0, "cx": 0, "box": None},
-            "obs": {"boxes": [], "person": 0, "vehicle": 0}
+            "zebra": {"percentage": 0, "cx": 0, "masks_list": [], "box": None},
         }
         
         idx = 0
@@ -522,44 +563,52 @@ def main():
             
             cycle = idx % cfg.PROCESS_CYCLE
             idx += 1
+
+            if idx % 300 == 0:
+                gc.collect()
             
-            # [排程邏輯] 分散運算
             if cycle == cfg.FRAME_TRAFFIC:
                 cache["traffic"] = detector.detect_traffic(frame, state_mgr.cnn_enabled)
                 
             elif cycle == cfg.FRAME_GREEN or cycle == cfg.FRAME_GREEN_2:
-                # 跑兩次綠色 (因為它快)
                 cache["green_path"] = detector.detect_green_path(frame)
                 
             elif cycle == cfg.FRAME_ZEBRA:
-                # 跑一次斑馬線 (因為它重)
                 cache["zebra"] = detector.detect_zebra(frame)
                 
-            elif cycle == cfg.FRAME_COMMON:
-                cache["obs"] = detector.detect_obstacles(frame)
+            elif cycle == cfg.FRAME_REST:
+                pass
             
-            state_mgr.update(cache["traffic"], cache["green_path"], cache["zebra"], cache["obs"], frame.shape[1])
+            state_mgr.update(cache["traffic"], cache["green_path"], cache["zebra"], frame.shape[1])
             
             # --- 畫面繪製 ---
             try:
-                # 1. 畫綠色人行道 (輪廓)
                 if cache["green_path"]["contours"]:
                     cv2.drawContours(frame, cache["green_path"]["contours"], -1, (0, 255, 0), 2)
                 
-                # 2. 畫斑馬線 (粉紅框)
-                if cache["zebra"]["box"] is not None:
-                    zx1, zy1, zx2, zy2 = cache["zebra"]["box"]
-                    cv2.rectangle(frame, (zx1, zy1), (zx2, zy2), (255, 0, 255), 3) 
-                    cv2.putText(frame, "Zebra", (zx1, zy1-10), 0, 0.7, (255, 0, 255), 2)
+                # 繪圖保護：先檢查 masks_list
+                if cache["zebra"].get("masks_list"):
+                    overlay = frame.copy()
+                    for mask_pts in cache["zebra"]["masks_list"]:
+                        cv2.fillPoly(overlay, [mask_pts], (0, 165, 255))
+                    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+                # 再檢查 box
+                elif cache["zebra"].get("box") is not None:
+                    bx1, by1, bx2, by2 = cache["zebra"]["box"]
+                    cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 0, 255), 3)
                 
-                # 顯示目前跟隨的目標點
-                target_cx = 0
-                if state_mgr.guidance_source == "ZEBRA":
-                    target_cx = cache["zebra"]["cx"]
-                    cv2.circle(frame, (target_cx, frame.shape[0]//2), 15, (255, 0, 255), -1) 
-                elif state_mgr.guidance_source == "GREEN":
-                    target_cx = cache["green_path"]["cx"]
-                    cv2.circle(frame, (target_cx, frame.shape[0]//2), 10, (0, 255, 0), -1) 
+                if state_mgr.smoothed_cx is not None and state_mgr.guidance_source != "NONE":
+                    cx = state_mgr.smoothed_cx
+                    h, w = frame.shape[:2]
+                    screen_center_x = w // 2
+                    guide_color = (0, 165, 255) if state_mgr.guidance_source == "ZEBRA" else (0, 255, 0)
+                    cv2.line(frame, (screen_center_x, h), (cx, h//2), guide_color, 4)
+                    cv2.circle(frame, (cx, h//2), 15, guide_color, -1)
+                    
+                    # 畫出安全區 (除錯用)
+                    limit = int(w * cfg.PATH_CENTER_RATIO)
+                    cv2.line(frame, (screen_center_x - limit, h), (screen_center_x - limit, 0), (100,100,100), 1)
+                    cv2.line(frame, (screen_center_x + limit, h), (screen_center_x + limit, 0), (100,100,100), 1)
                 
                 roi_y = int(frame.shape[0] * cfg.ROAD_ROI_TOP)
                 cv2.line(frame, (0, roi_y), (frame.shape[1], roi_y), (100, 100, 100), 1)
@@ -573,7 +622,6 @@ def main():
                 if state_mgr.countdown["active"]:
                     cv2.putText(frame, f"CNT: {state_mgr.countdown['value']}", (30,80), 0, 2, (0,255,255), 3)
                 
-                # 顯示狀態
                 status_text = f"Path: {state_mgr.path_state}"
                 if state_mgr.guidance_source != "NONE":
                     status_text += f" [{state_mgr.guidance_source}]"
@@ -583,33 +631,21 @@ def main():
             
             except Exception as draw_err:
                 print(f"Drawing Error: {draw_err}") 
+                traceback.print_exc()
 
             key = cv2.waitKey(delay_time) & 0xFF
             
             if key == ord('q'): 
                 print("使用者手動退出。")
                 os._exit(0) 
-                
-            elif key == ord('k'): 
-                print("\n[測試] 3秒後模擬程式崩潰...")
-                time.sleep(1) 
-                raise RuntimeError("這是手動觸發的測試崩潰！")
-
-            elif key == ord('f'): 
-                print("\n[測試] 系統模擬死當 (無限迴圈)...")
-                while True:
-                    time.sleep(1) 
 
         stop_event.set()
         tts.stop()
         cv2.destroyAllWindows()
     
     except Exception as e:
-        print("\n" + "="*40)
-        print("❌ 程式發生錯誤 (CRASHED)")
-        print(f"錯誤訊息: {e}")
-        print("="*40)
-        emergency_speak("系統錯誤，請原地停止") 
+        print(f"CRASHED: {e}")
+        emergency_speak("系統錯誤") 
         os._exit(1)
 
 if __name__ == "__main__":
